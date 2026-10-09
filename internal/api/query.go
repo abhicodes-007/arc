@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -673,19 +674,20 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db                 *database.DuckDB
-	storage            storage.Backend
-	pruner             *pruning.PartitionPruner
-	fieldSchema        *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
-	emptyRangeAnchor   bool                  // #928: answer a proven-empty range from a complete anchor alone
-	queryCache         *database.QueryCache
-	logger             zerolog.Logger
-	authManager        *auth.AuthManager
-	rbacManager        RBACChecker
-	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
-	parallelExecutor   *query.ParallelExecutor
-	queryTimeout       time.Duration // Query timeout (0 = no timeout)
-	slowQueryThreshold time.Duration // Slow query WARN threshold (0 = disabled)
+	db                      *database.DuckDB
+	storage                 storage.Backend
+	pruner                  *pruning.PartitionPruner
+	fieldSchema             *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	emptyRangeAnchor        bool                  // #928: answer a proven-empty range from a complete anchor alone
+	queryCache              *database.QueryCache
+	logger                  zerolog.Logger
+	authManager             *auth.AuthManager
+	rbacManager             RBACChecker
+	debugEnabled            bool // Cached check for debug logging to avoid repeated level checks
+	parallelExecutor        *query.ParallelExecutor
+	queryTimeout            time.Duration // Query timeout (0 = no timeout)
+	disableClientDisconnect bool
+	slowQueryThreshold      time.Duration // Slow query WARN threshold (0 = disabled)
 
 	// Cluster routing support
 	router *cluster.Router
@@ -829,10 +831,24 @@ var (
 
 	// Dangerous patterns for WHERE clause
 	dangerousQueryPatterns = []string{
-		";",      // Statement terminator
-		"--",     // SQL comment
-		"/*",     // Multi-line comment start
-		"*/",     // Multi-line comment end
+		";",  // Statement terminator
+		"--", // SQL comment
+		"/*", // Multi-line comment start
+		"*/", // Multi-line comment end
+	}
+	// Keywords are matched as whole words (containsSQLWord), so identifiers
+	// such as created_at or dataset pass. The former xp_/sp_ entries are gone:
+	// they are SQL Server procedure prefixes DuckDB has no notion of, and as
+	// substrings they refused any identifier containing them. The delete API's
+	// copy of the same two strings is tracked in #1077.
+	// numberGluedToWord matches a digit run at a token start that runs straight
+	// into letters, so `1UNION` can be split into `1 UNION` before the
+	// whole-word keyword scan.
+	numberGluedToWord = regexp.MustCompile(`(^|[^A-Za-z0-9_])([0-9]+)([a-z])`)
+	// maskPlaceholder matches the lower-cased placeholders sqlutil.MaskStringLiterals
+	// leaves for string literals and quoted identifiers.
+	maskPlaceholder        = regexp.MustCompile(`__(?:str|ident)_[0-9]+__`)
+	dangerousQueryKeywords = []string{
 		"DROP",   // DDL
 		"DELETE", // DML (in WHERE context means injection attempt)
 		"INSERT",
@@ -842,8 +858,6 @@ var (
 		"CREATE",
 		"EXEC",
 		"EXECUTE",
-		"xp_",
-		"sp_",
 		"UNION",
 	}
 )
@@ -901,12 +915,36 @@ func validateWhereClauseQuery(where string) error {
 		return fmt.Errorf("where clause too long (max 4096 characters)")
 	}
 
-	whereUpper := strings.ToUpper(where)
+	// Scan a string-literal-masked copy (#987): a keyword or comment marker
+	// inside a value is data, not SQL. Backtick identifiers are normalised to
+	// double quotes first, as ValidateSQLRequest does, because the masker does
+	// not know backticks and a quote inside one would otherwise open a
+	// spurious literal that hides whatever follows it. The raw clause is what
+	// the quote and parenthesis counts below check and what reaches the SQL
+	// assembly; ValidateSQLRequest then validates the assembled statement.
+	maskInput := backticksToDoubleQuotes(where)
+	whereMasked, _ := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// DuckDB lexes a number glued to a word as two tokens (`1UNION` is `1`
+	// then `UNION`), while the whole-word scan below treats digits as
+	// identifier bytes and would not see the keyword. Split a number that
+	// starts a token from the letters that follow it; an identifier such as
+	// x1union, whose digits are not at a token start, is left alone.
+	whereLower := numberGluedToWord.ReplaceAllString(strings.ToLower(whereMasked), "$1$2 $3")
+	// The masker's placeholders are identifier-shaped (__str_0__), so a keyword
+	// glued to a literal (`host='a'union select ...`) would have no word
+	// boundary either. Blank them for the keyword scan; the punctuation scan
+	// above does not care, and nothing after this reads the placeholders.
+	whereLowerKeywords := maskPlaceholder.ReplaceAllString(whereLower, " ")
 
-	// Check for dangerous patterns
+	// Check for dangerous patterns outside string literals.
 	for _, pattern := range dangerousQueryPatterns {
-		if strings.Contains(whereUpper, pattern) {
+		if strings.Contains(whereLower, strings.ToLower(pattern)) {
 			return fmt.Errorf("where clause contains forbidden pattern: %s", pattern)
+		}
+	}
+	for _, keyword := range dangerousQueryKeywords {
+		if containsSQLWord(whereLowerKeywords, strings.ToLower(keyword)) {
+			return fmt.Errorf("where clause contains forbidden pattern: %s", keyword)
 		}
 	}
 
@@ -958,6 +996,37 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		queryTimeout:       queryTimeout,
 		slowQueryThreshold: slowQueryThreshold,
 	}
+}
+
+// SetCancelOnClientDisconnect controls whether query contexts are cancelled
+// when the client connection closes before the response finishes. Some HTTP
+// clients half-close their write side after sending a request; operators can
+// disable this behavior for those clients.
+func (h *QueryHandler) SetCancelOnClientDisconnect(enabled bool) {
+	h.disableClientDisconnect = !enabled
+}
+
+// watchQueryClientDisconnect starts the connection watcher and returns a
+// once-only metric recorder for the later streaming-error path.
+func (h *QueryHandler) watchQueryClientDisconnect(queryCtx context.Context, conn net.Conn, queryID string, cancel context.CancelFunc, path string) func() {
+	var disconnectOnce sync.Once
+	recordDisconnect := func() {
+		disconnectOnce.Do(func() {
+			metrics.Get().IncQueryClientDisconnect(path)
+		})
+	}
+	if h.disableClientDisconnect {
+		return recordDisconnect
+	}
+	watchClientDisconnect(queryCtx, conn, func() {
+		recordDisconnect()
+		h.logger.Warn().Str("query_id", queryID).Msg("Query cancelled after client disconnect")
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.CancelWithReason(queryID, "client disconnected")
+		}
+		cancel()
+	})
+	return recordDisconnect
 }
 
 // logSlowQuery emits a WARN log and increments the slow query counter if
@@ -2100,6 +2169,10 @@ localProcessing:
 			// Note: cancelTimeout is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+		if cancelTimeout == nil {
+			execCtx, cancelTimeout = context.WithCancel(execCtx)
+		}
+		recordDisconnect := h.watchQueryClientDisconnect(execCtx, c.Context().Conn(), queryID, cancelTimeout, metrics.DisconnectPathSQLJSON)
 		results, err := h.parallelExecutor.ExecutePartitioned(
 			execCtx,
 			parallelInfo.Paths,
@@ -2297,7 +2370,7 @@ localProcessing:
 				}
 				// Per-handler client-disconnect counter (#426).
 				if isClientError(streamErr) {
-					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+					recordDisconnect()
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -2336,6 +2409,10 @@ localProcessing:
 			// Note: cancel is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+		if cancel == nil {
+			ctx, cancel = context.WithCancel(ctx)
+		}
+		recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
 		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
@@ -2578,7 +2655,7 @@ localProcessing:
 				}
 				// Per-handler client-disconnect counter (#426).
 				if isClientError(streamErr) {
-					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+					recordDisconnect()
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -3702,8 +3779,32 @@ func shouldSkipTableConversion(table string) bool {
 // or: {database}/{measurement}/**/*.parquet (relative path)
 // The key insight: database/measurement are always followed by year directories (4-digit numbers)
 func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
-	// Normalize path separators
-	path = strings.ReplaceAll(path, "\\", "/")
+	// Backslashes are forbidden in storage keys. A local backend may,
+	// however, have native separators in its trusted root on Windows.
+	if strings.Contains(path, `\`) {
+		local, ok := h.storage.(*storage.LocalBackend)
+		if !ok {
+			return "", ""
+		}
+
+		root := local.GetBasePath()
+		if !strings.HasSuffix(root, string(filepath.Separator)) {
+			root += string(filepath.Separator)
+		}
+
+		// Only the exact local root may contain native separators. Never
+		// normalise a backslash in the database, measurement or file key.
+		if !strings.HasPrefix(path, root) {
+			return "", ""
+		}
+		keyPath := strings.TrimPrefix(path, root)
+		if strings.Contains(keyPath, `\`) {
+			return "", ""
+		}
+
+		// The remaining suffix contains no backslashes; parse it using '/'.
+		path = keyPath
+	}
 
 	// Remove any s3:// or azure:// prefix and bucket name
 	if strings.Contains(path, "://") {
@@ -4336,6 +4437,13 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 			databases = h.extractTopLevelDirs(files)
 		}
 	}
+	// A store that does not exist yet answers an empty result set, not an
+	// error: the bucket appears on the first authenticated write (#945). Only
+	// the read paths named in that issue opt in — see storage.ErrStoreNotFound
+	// for why a missing store must stay an error everywhere that decides.
+	if storage.IsStoreNotFound(err) {
+		databases, err = nil, nil
+	}
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
@@ -4435,6 +4543,11 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		} else {
 			tables = h.extractTableNames(files, database)
 		}
+	}
+	// As in SHOW DATABASES: a store that does not exist yet is an empty
+	// result set (#945), and nowhere else.
+	if storage.IsStoreNotFound(err) {
+		tables, err = nil, nil
 	}
 
 	if err != nil {
@@ -5252,8 +5365,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// SECURITY (GHSA-wmjj-g8xc-6hwr): run the SHARED validator over the fully
 	// assembled statement.
 	//
-	// validateWhereClauseQuery above is a substring blocklist that blocks
-	// neither SELECT nor any DuckDB I/O table function, so a `where` fragment
+	// validateWhereClauseQuery above is a blocklist (whole-word keywords and
+	// substring punctuation on a literal-masked copy) that blocks neither
+	// SELECT nor any DuckDB I/O table function, so a `where` fragment
 	// could smuggle a cross-tenant read through a scalar subquery
 	// (`time > (SELECT max(v) FROM parquet_scan('/other-tenant/d.parquet'))`).
 	// RBAC only inspects the path params, and the DuckDB sandbox allowlists the
@@ -5287,7 +5401,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// route and query string. It cannot see the user-supplied `where` fragment,
 	// which the transform below rewrites like any other table position — so a
 	// subquery in `where` read a second measurement that nothing had
-	// authorized. validateWhereClauseQuery is a substring blocklist and does
+	// authorized. validateWhereClauseQuery is a keyword blocklist and does
 	// not stop it: it blocks `;`, comments and DDL/DML, not a nested read.
 	// Enumerating read syntaxes does not work either — DuckDB spells the same
 	// thing `(SELECT x FROM t)`, `(FROM t)` and `(TABLE t)`, and `FROM` is
@@ -5332,8 +5446,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	// Create context with timeout if configured (0 = no timeout).
-	// Same pattern as POST /api/v1/query: start from UserContext so client
-	// disconnects cancel the query, then wrap with queryTimeout (#308).
+	// Same pattern as POST /api/v1/query: start from UserContext, watch the
+	// client connection for disconnects, then wrap with queryTimeout (#308).
 	// A governance policy's MaxDuration overrides the global timeout (#702),
 	// matching the POST handler's effectiveTimeout semantics.
 	effectiveTimeout := h.queryTimeout
@@ -5391,6 +5505,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		// paths below), not deferred here, because SetBodyStreamWriter runs
 		// asynchronously after this function returns.
 	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// Dispositions for the Arrow JSON path, which owns the response once it
 	// reports handled=true and streams asynchronously. Passing these rather
@@ -5520,7 +5638,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			// uses the pure database/sql streaming JSON path same as the
 			// other sites above, so it shares the sql_json label.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+				recordDisconnect()
 			}
 			// Warn for client-disconnect / context expiry (headers already
 			// committed, partial result was delivered). Error for genuine
